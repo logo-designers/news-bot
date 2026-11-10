@@ -2,12 +2,13 @@
 Автономный бот: еврейские новости Украины -> полноценные заметки на иврите -> Telegram-канал.
 
 Как работает:
-  1. Собирает свежие новости из RSS (израильские сайты на иврите + украинские/русские
-     еврейские источники + Google News по ключевым словам).
-  2. Скачивает текст статьи.
-  3. Gemini (бесплатный ИИ от Google) проверяет, что новость действительно о евреях Украины
-     и не повторяет уже опубликованную, и пишет по ней собственную заметку на иврите.
-  4. Публикует в канал: заголовок + текст, без ссылок.
+  1. Собирает свежие новости из RSS: израильские сайты на иврите, украинские еврейские
+     организации, поиск Bing News и Google News по ключевым словам.
+  2. Отбрасывает явно не относящиеся к теме (по ключевым словам) — экономит лимит ИИ.
+  3. Скачивает полный текст статьи.
+  4. Gemini (бесплатный ИИ от Google) проверяет, что новость о евреях Украины и не повтор,
+     и пишет по ней собственную заметку на иврите.
+  5. Публикует в канал: заголовок + текст, без ссылок.
 
 Переменные окружения:
   BOT_TOKEN      — токен бота от @BotFather (обязательно)
@@ -23,7 +24,7 @@ import re
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, urlparse, parse_qs
 
 import feedparser
 import requests
@@ -36,48 +37,63 @@ SIGNATURE = "@Ukraine_Jewish_Kosher_Guide"  # подпись внизу пост
 SHOW_SOURCE = True       # писать в конце "מקור: <название СМИ>" (без ссылки)
 USE_PHOTOS = False       # True — прикладывать фото из статьи (фото принадлежат СМИ)
 MAX_POSTS_PER_RUN = 3    # не больше N постов за запуск (запуск раз в час)
-MAX_AI_CALLS_PER_RUN = 10
+MAX_AI_CALLS_PER_RUN = 5 # бесплатный лимит Gemini небольшой — не тратим лишнее
 MAX_AGE_HOURS = 48       # более старые новости игнорируются
+USE_SEARCH_FALLBACK = True  # если текст статьи не скачался — попросить Gemini найти новость в Google
 
-# Модели Gemini по порядку: если одна недоступна или кончилась квота — берётся следующая
-GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"]
+# Слова, хотя бы одно из которых должно быть в заголовке/тексте (иначе новость даже не отправляется в ИИ)
+JEWISH_WORDS = [
+    "יהוד", "חב\"ד", "חב''ד", "חבד", "רב ", "הרב", "רבני", "קהיל", "בית כנסת", "בית הכנסת",
+    "אומן", "ברסלב", "שואה", "עלי", "שליח", "כשר", "תורה", "ישיב", "אנטישמ",
+    "евре", "єврей", "иуде", "юде", "юдаї", "раввин", "рабин", "синагог", "хабад", "хасид",
+    "умань", "холокост", "голокост", "антисемит", "алия", "алія", "кошер", "мацев", "ваад",
+    "jew", "rabbi", "chabad", "synagog", "uman", "holocaust",
+]
 
 
 def gnews(query, lang):
-    """RSS-лента поиска Google News за последние 2 дня."""
+    """RSS поиска Google News за 2 дня."""
     region = {"he": "hl=he&gl=IL&ceid=IL:he",
               "ru": "hl=ru&gl=UA&ceid=UA:ru",
               "uk": "hl=uk&gl=UA&ceid=UA:uk"}[lang]
     return f"https://news.google.com/rss/search?q={quote_plus(query + ' when:2d')}&{region}"
 
 
+def bing(query, mkt):
+    """RSS поиска Bing News (в нём настоящие ссылки на статьи)."""
+    return f"https://www.bing.com/news/search?q={quote_plus(query)}&format=rss&mkt={mkt}&qft=sortbydate%3d%221%22"
+
+
 def wp_tag(site, tag):
-    """RSS-лента тега на сайте WordPress."""
+    """RSS тега на сайте WordPress."""
     return f"{site}/tag/{quote(tag)}/feed/"
 
 
 FEEDS = [
-    # --- Израильские сайты на иврите, прямые ленты ---
+    # --- Прямые ленты сайтов (полный текст статей) ---
     wp_tag("https://www.jdn.co.il", "אוקראינה"),
     wp_tag("https://www.jdn.co.il", "אומן"),
     wp_tag("https://www.jdn.co.il", "קייב"),
-    # --- Украинские еврейские организации ---
     "https://vaadua.org/rss.xml",
-    # --- Google News на иврите ---
+    # --- Bing News ---
+    bing("יהודי אוקראינה", "he-IL"),
+    bing("הקהילה היהודית באוקראינה", "he-IL"),
+    bing('חב"ד אוקראינה', "he-IL"),
+    bing("אומן ברסלב", "he-IL"),
+    bing("еврейская община Украины", "ru-RU"),
+    bing("раввин Украина", "ru-RU"),
+    bing("єврейська громада України", "uk-UA"),
+    bing("Умань хасиди", "uk-UA"),
+    # --- Google News (ссылки раскодируются не всегда — обрабатываются в последнюю очередь) ---
     gnews("יהודי אוקראינה", "he"),
     gnews("הקהילה היהודית באוקראינה", "he"),
     gnews('שליח חב"ד אוקראינה', "he"),
     gnews("הרב הראשי של אוקראינה", "he"),
     gnews("אומן ברסלב", "he"),
-    gnews("יהודי קייב OR יהודי אודסה OR יהודי דנייפר OR יהודי חרקוב", "he"),
-    # --- Google News на русском / украинском (ИИ перескажет на иврите) ---
     gnews("еврейская община Украины", "ru"),
     gnews("раввин Украины", "ru"),
-    gnews("site:fjc.org.ua", "ru"),
-    gnews("site:vaadua.org", "uk"),
     gnews("єврейська громада", "uk"),
     gnews("рабин Україна", "uk"),
-    gnews("Умань хасиди", "uk"),
 ]
 
 # ============================ КОД ============================
@@ -90,29 +106,46 @@ STATE_FILE = "state.json"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 NOW = datetime.now(timezone.utc)
+API = "https://generativelanguage.googleapis.com/v1beta"
+KIND_ORDER = {"direct": 0, "bing": 1, "gnews": 2}
 
 
 class QuotaExceeded(Exception):
     pass
 
 
-# ---------- состояние (что уже опубликовано) ----------
+class SearchUnavailable(Exception):
+    pass
+
+
+# ---------- состояние ----------
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {"seen": {}, "recent_titles": [], "fails": {}, "alerts": {}}
+            st = json.load(f)
+    else:
+        st = {}
+    for k, v in {"seen": {}, "recent_titles": [], "fails": {}, "alerts": {}}.items():
+        st.setdefault(k, v)
+    return st
 
 
 def save_state(state):
     cutoff = (NOW - timedelta(days=30)).isoformat()
     state["seen"] = {k: v for k, v in state["seen"].items() if v > cutoff}
     state["recent_titles"] = state["recent_titles"][-40:]
-    # отметка раз в сутки — чтобы GitHub не отключил расписание из-за "неактивности"
-    state["heartbeat"] = NOW.strftime("%Y-%m-%d")
+    state["heartbeat"] = NOW.strftime("%Y-%m-%d")  # чтобы GitHub не счёл репозиторий заброшенным
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=1)
+
+
+def mark_fail(state, item_id):
+    fails = state["fails"].get(item_id, 0) + 1
+    state["fails"][item_id] = fails
+    if fails >= 3:
+        state["seen"][item_id] = NOW.isoformat()
+        state["fails"].pop(item_id, None)
 
 
 # ---------- Telegram ----------
@@ -164,60 +197,79 @@ def clean(text):
     return re.sub(r"\s+", " ", html.unescape(text)).strip()
 
 
+def site_name(url):
+    host = urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def bing_real_url(link):
+    q = parse_qs(urlparse(link).query)
+    return q["url"][0] if q.get("url") else link
+
+
+def looks_relevant(text):
+    t = text.lower()
+    return any(w in t for w in JEWISH_WORDS)
+
+
 def collect():
-    items, working_feeds = [], 0
+    items, working = [], 0
     cutoff = NOW - timedelta(hours=MAX_AGE_HOURS)
     for url in FEEDS:
+        kind = "gnews" if "news.google.com" in url else "bing" if "bing.com" in url else "direct"
         try:
             resp = requests.get(url, headers={"User-Agent": UA}, timeout=30)
             feed = feedparser.parse(resp.content)
         except Exception as e:
-            print("Лента недоступна:", url, e)
+            print("Лента недоступна:", url[:90], e)
             continue
         if feed.entries:
-            working_feeds += 1
-        print(f"{len(feed.entries):3d} записей  {url[:110]}")
+            working += 1
+        print(f"{len(feed.entries):3d} записей  [{kind}] {url[:100]}")
         feed_title = clean(feed.feed.get("title", ""))
         for e in feed.entries:
             t = e.get("published_parsed") or e.get("updated_parsed")
             dt = datetime(*t[:6], tzinfo=timezone.utc) if t else NOW
             if dt < cutoff:
                 continue
-            is_gnews = "news.google.com" in url
-            source = (e.get("source") or {}).get("title", "") if is_gnews else feed_title
+            link = e.get("link", "")
             title = clean(e.get("title", ""))
-            if is_gnews and source and title.endswith(" - " + source):
-                title = title[: -len(" - " + source)]
-            full = ""
-            if e.get("content"):
-                full = clean(e.content[0].get("value", ""))
+            if kind == "gnews":
+                source = (e.get("source") or {}).get("title", "")
+                if source and title.endswith(" - " + source):
+                    title = title[: -len(" - " + source)]
+            elif kind == "bing":
+                link = bing_real_url(link)
+                source = clean(e.get("news_source", "")) or site_name(link)
+            else:
+                source = feed_title.split(" - ")[0].split(" | ")[0].strip() or site_name(link)
+            full = clean(e.content[0].get("value", "")) if e.get("content") else ""
             items.append({
-                "id": e.get("id") or e.get("link"),
+                "id": e.get("id") or link,
                 "title": title,
-                "link": e.get("link", ""),
-                "source": source.split(" - ")[0].strip(),
+                "link": link,
+                "source": source,
                 "date": dt.isoformat(),
                 "rss_text": full or clean(e.get("summary", "")),
-                "gnews": is_gnews,
+                "kind": kind,
             })
-    # убрать одинаковые заголовки, сортировка от старых к новым
     uniq = {}
-    for it in items:
-        uniq.setdefault(it["title"].lower(), it)
-    return sorted(uniq.values(), key=lambda x: x["date"]), working_feeds
+    for it in sorted(items, key=lambda x: KIND_ORDER[x["kind"]]):
+        uniq.setdefault(re.sub(r"\W+", "", it["title"].lower()), it)
+    return list(uniq.values()), working
 
 
 def resolve_link(it):
-    if not it["gnews"]:
+    if it["kind"] != "gnews":
         return it["link"]
     try:
         from googlenewsdecoder import gnewsdecoder
         r = gnewsdecoder(it["link"], interval=1)
         if r.get("status"):
             return r["decoded_url"]
-        print("  ссылка Google News не раскодировалась:", str(r.get("message", ""))[:150])
+        print("  ссылка Google News не раскодировалась")
     except Exception as e:
-        print("Не удалось раскодировать ссылку Google News:", e)
+        print("  ошибка раскодирования Google News:", e)
     return None
 
 
@@ -227,7 +279,7 @@ def fetch_article(url):
         r.raise_for_status()
         page = r.text
     except Exception as e:
-        print("Статья не скачалась:", url, e)
+        print("  статья не скачалась:", str(e)[:150])
         return "", None
     text = trafilatura.extract(page, include_comments=False, include_tables=False) or ""
     image = None
@@ -249,8 +301,9 @@ Israel–Ukraine relations as they affect Jews).
 Below is a news article (it may be in Hebrew, Russian, Ukrainian or English).
 
 Tasks:
-1. "relevant": true only if the article is mainly about Jews / Jewish life / Jewish community in Ukraine
-   (or Ukrainian Jews / Uman pilgrims). General war news, Israeli politics, or Jews elsewhere -> false.
+1. "relevant": true only if the article is a NEWS report mainly about Jews / Jewish life / Jewish community
+   in Ukraine (or Ukrainian Jews / Uman pilgrims). General war news, Israeli politics, Jews elsewhere,
+   opinion columns, archive pages or ads -> false.
 2. "duplicate": true if it reports the same event as one of these already published headlines:
 {recent}
 3. If relevant and not duplicate, write an ORIGINAL news item in modern Hebrew, in your own words
@@ -269,7 +322,6 @@ Article text:
 {text}
 """
 
-
 SEARCH_PROMPT = """Use Google Search to find this news story and read the details from reliable sources.
 Headline: {title}
 Published by: {source}
@@ -281,6 +333,43 @@ Otherwise, use the facts you found as the "article text" for the task below.
 
 """
 
+_models_cache = None
+
+
+def version_key(name):
+    nums = re.findall(r"\d+(?:\.\d+)?", name)
+    return float(nums[0]) if nums else 0.0
+
+
+def gemini_models():
+    """Список доступных моделей Flash — узнаём у Google, чтобы не зависеть от устаревших имён."""
+    global _models_cache
+    if _models_cache is not None:
+        return _models_cache
+    found = []
+    try:
+        r = requests.get(f"{API}/models?pageSize=200", headers={"x-goog-api-key": GEMINI_KEY}, timeout=30)
+        if r.status_code in (400, 401, 403):
+            raise RuntimeError("Ключ Gemini не работает: " + r.text[:300])
+        for m in r.json().get("models", []):
+            name = m.get("name", "").replace("models/", "")
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            if "flash" not in name or any(b in name for b in
+                                          ("image", "tts", "audio", "live", "thinking", "exp", "embed", "robotics", "computer")):
+                continue
+            found.append(name)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        print("Не удалось получить список моделей:", e)
+    # стабильные новые flash -> flash-lite -> preview
+    found.sort(key=lambda n: ("preview" in n, "lite" in n, -version_key(n), len(n)))
+    models = ["gemini-flash-latest"] + found + ["gemini-flash-lite-latest"]
+    _models_cache = list(dict.fromkeys(models))
+    print("Модели Gemini:", ", ".join(_models_cache[:8]))
+    return _models_cache
+
 
 def parse_json(raw):
     raw = re.sub(r"^```(json)?|```$", "", raw.strip()).strip()
@@ -288,55 +377,58 @@ def parse_json(raw):
         return json.loads(raw)
     except Exception:
         m = re.search(r"\{.*\}", raw, re.S)
-        return json.loads(m.group(0)) if m else None
+        try:
+            return json.loads(m.group(0)) if m else None
+        except Exception:
+            return None
 
 
 def ask_gemini(prompt, search=False):
-    quota_hit = False
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.4}}
     if search:
         body["tools"] = [{"google_search": {}}]
     else:
         body["generationConfig"]["responseMimeType"] = "application/json"
-    for model in GEMINI_MODELS:
+
+    limited = 0
+    models = gemini_models()
+    for model in models:
         for attempt in range(2):
             try:
-                r = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    headers={"x-goog-api-key": GEMINI_KEY},
-                    json=body,
-                    timeout=180,
-                )
+                r = requests.post(f"{API}/models/{model}:generateContent",
+                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=180)
             except requests.RequestException as e:
-                print(f"Gemini {model}: сеть", e)
+                print(f"  Gemini {model}: сеть", e)
                 time.sleep(5)
                 continue
             if r.status_code == 429:
-                quota_hit = True
-                print(f"Gemini {model}: лимит, пробую другую модель")
+                limited += 1
+                print(f"  Gemini {model}: лимит")
                 break
-            if r.status_code in (400, 403, 404):
-                print(f"Gemini {model}: {r.status_code} {r.text[:300]}")
-                if "API_KEY" in r.text or r.status_code == 403:
-                    raise RuntimeError("Ключ Gemini не работает: " + r.text[:300])
+            if r.status_code in (401, 403) or "API_KEY_INVALID" in r.text:
+                raise RuntimeError("Ключ Gemini не работает: " + r.text[:300])
+            if r.status_code in (400, 404):
+                print(f"  Gemini {model}: {r.status_code} недоступна")
                 break
             if r.status_code >= 500:
-                time.sleep(10)
+                print(f"  Gemini {model}: сервер занят ({r.status_code}), повтор")
+                time.sleep(8)
                 continue
             try:
                 parts = r.json()["candidates"][0]["content"]["parts"]
                 raw = "".join(p.get("text", "") for p in parts if not p.get("thought"))
                 res = parse_json(raw)
-                if res is None:
-                    raise ValueError("нет JSON")
-                return res
+                if res is not None:
+                    return res
+                print(f"  Gemini {model}: ответ без JSON")
             except Exception as e:
-                print(f"Gemini {model}: непонятный ответ", e, r.text[:300])
-                continue
-        time.sleep(4)
-    if quota_hit:
-        raise QuotaExceeded()
+                print(f"  Gemini {model}: непонятный ответ", e, r.text[:200])
+            break
+        if limited >= 3:
+            break
+    if limited:
+        raise SearchUnavailable() if search else QuotaExceeded()
     return None
 
 
@@ -350,45 +442,58 @@ def run(state):
         return
 
     seen = state["seen"]
-    new = [it for it in items if it["id"] not in seen]
+    new = []
+    for it in items:
+        if it["id"] in seen:
+            continue
+        if not looks_relevant(it["title"] + " " + it["rss_text"]):
+            seen[it["id"]] = NOW.isoformat()  # явно не по теме — не тратим ИИ
+            continue
+        new.append(it)
+    # прямые сайты -> Bing -> Google News; внутри — свежие первыми
+    new.sort(key=lambda x: (KIND_ORDER[x["kind"]], -datetime.fromisoformat(x["date"]).timestamp()))
+    print(f"Новых по теме для обработки: {len(new)}")
 
-    # сначала новости с прямых сайтов (там есть полный текст), потом Google News; свежие — первыми
-    new.sort(key=lambda x: (x["gnews"], -datetime.fromisoformat(x["date"]).timestamp()))
-
-    print(f"Новых для обработки: {len(new)}")
     posted = calls = 0
+    search_ok = USE_SEARCH_FALLBACK
     for it in new:
         if posted >= MAX_POSTS_PER_RUN or calls >= MAX_AI_CALLS_PER_RUN:
             break
-        print("\n→", it["title"], "|", it["source"])
+        print(f"\n→ [{it['kind']}] {it['title']} | {it['source']}")
 
         url = resolve_link(it)
         text, image = fetch_article(url) if url else ("", None)
         if len(text) < len(it["rss_text"]):
             text = it["rss_text"]
+
         recent = "\n".join(f"- {t}" for t in state["recent_titles"][-25:]) or "- (none)"
         search = len(text) < 400
         if search:
-            # текст статьи недоступен — Gemini сам найдёт новость через Google Search
-            print("  текста статьи нет — ищу новость через Gemini + Google Search")
+            if not search_ok:
+                print("  текста нет, поиск недоступен — попробую в другой раз")
+                mark_fail(state, it["id"])
+                continue
+            print("  текста нет — ищу новость через Gemini + Google Search")
             prompt = SEARCH_PROMPT.format(title=it["title"], source=it["source"],
                                           date=it["date"][:10], snippet=text[:500])
             prompt += PROMPT.format(recent=recent, title=it["title"], source=it["source"],
-                                    text="(see the facts you found via search)")
+                                    text="(use the facts you found via search)")
         else:
             prompt = PROMPT.format(recent=recent, title=it["title"], source=it["source"], text=text[:12000])
+
         calls += 1
         try:
             res = ask_gemini(prompt, search=search)
+        except SearchUnavailable:
+            print("  поиск Google в Gemini недоступен на бесплатном тарифе — дальше только статьи с текстом")
+            search_ok = False
+            mark_fail(state, it["id"])
+            continue
         except QuotaExceeded:
-            print("Лимит Gemini на сегодня исчерпан — продолжу в следующий запуск")
+            print("Лимит Gemini исчерпан — продолжу в следующий запуск")
             break
         if not res:
-            fails = state["fails"].get(it["id"], 0) + 1
-            state["fails"][it["id"]] = fails
-            if fails >= 3:
-                seen[it["id"]] = NOW.isoformat()
-                state["fails"].pop(it["id"], None)
+            mark_fail(state, it["id"])
             continue
 
         seen[it["id"]] = NOW.isoformat()
@@ -404,6 +509,7 @@ def run(state):
             print("  ИИ вернул пустой текст")
             continue
         if publish(title, body, it["source"], image):
+            print("  ✅ опубликовано")
             state["recent_titles"].append(title)
             posted += 1
             time.sleep(5)

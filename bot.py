@@ -38,7 +38,6 @@ USE_PHOTOS = False       # True — прикладывать фото из ст�
 MAX_POSTS_PER_RUN = 3    # не больше N постов за запуск (запуск раз в час)
 MAX_AI_CALLS_PER_RUN = 10
 MAX_AGE_HOURS = 48       # более старые новости игнорируются
-FIRST_RUN_POSTS = 3      # при самом первом запуске — только 3 самые свежие
 
 # Модели Gemini по порядку: если одна недоступна или кончилась квота — берётся следующая
 GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"]
@@ -216,6 +215,7 @@ def resolve_link(it):
         r = gnewsdecoder(it["link"], interval=1)
         if r.get("status"):
             return r["decoded_url"]
+        print("  ссылка Google News не раскодировалась:", str(r.get("message", ""))[:150])
     except Exception as e:
         print("Не удалось раскодировать ссылку Google News:", e)
     return None
@@ -270,17 +270,42 @@ Article text:
 """
 
 
-def ask_gemini(prompt):
+SEARCH_PROMPT = """Use Google Search to find this news story and read the details from reliable sources.
+Headline: {title}
+Published by: {source}
+Date: {date}
+Short snippet: {snippet}
+
+If you cannot find reliable details about this exact story, answer {{"relevant": false}}.
+Otherwise, use the facts you found as the "article text" for the task below.
+
+"""
+
+
+def parse_json(raw):
+    raw = re.sub(r"^```(json)?|```$", "", raw.strip()).strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        m = re.search(r"\{.*\}", raw, re.S)
+        return json.loads(m.group(0)) if m else None
+
+
+def ask_gemini(prompt, search=False):
     quota_hit = False
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.4}}
+    if search:
+        body["tools"] = [{"google_search": {}}]
+    else:
+        body["generationConfig"]["responseMimeType"] = "application/json"
     for model in GEMINI_MODELS:
         for attempt in range(2):
             try:
                 r = requests.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                     headers={"x-goog-api-key": GEMINI_KEY},
-                    json={"contents": [{"parts": [{"text": prompt}]}],
-                          "generationConfig": {"temperature": 0.4,
-                                               "responseMimeType": "application/json"}},
+                    json=body,
                     timeout=180,
                 )
             except requests.RequestException as e:
@@ -302,8 +327,10 @@ def ask_gemini(prompt):
             try:
                 parts = r.json()["candidates"][0]["content"]["parts"]
                 raw = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-                raw = re.sub(r"^```(json)?|```$", "", raw.strip()).strip()
-                return json.loads(raw)
+                res = parse_json(raw)
+                if res is None:
+                    raise ValueError("нет JSON")
+                return res
             except Exception as e:
                 print(f"Gemini {model}: непонятный ответ", e, r.text[:300])
                 continue
@@ -325,10 +352,8 @@ def run(state):
     seen = state["seen"]
     new = [it for it in items if it["id"] not in seen]
 
-    if not seen:  # первый запуск — не заваливаем канал
-        for it in new[:-FIRST_RUN_POSTS]:
-            seen[it["id"]] = NOW.isoformat()
-        new = new[-FIRST_RUN_POSTS:]
+    # сначала новости с прямых сайтов (там есть полный текст), потом Google News; свежие — первыми
+    new.sort(key=lambda x: (x["gnews"], -datetime.fromisoformat(x["date"]).timestamp()))
 
     print(f"Новых для обработки: {len(new)}")
     posted = calls = 0
@@ -341,24 +366,29 @@ def run(state):
         text, image = fetch_article(url) if url else ("", None)
         if len(text) < len(it["rss_text"]):
             text = it["rss_text"]
-        if len(text) < 250:
-            print("  мало текста, пропуск")
+        recent = "\n".join(f"- {t}" for t in state["recent_titles"][-25:]) or "- (none)"
+        search = len(text) < 400
+        if search:
+            # текст статьи недоступен — Gemini сам найдёт новость через Google Search
+            print("  текста статьи нет — ищу новость через Gemini + Google Search")
+            prompt = SEARCH_PROMPT.format(title=it["title"], source=it["source"],
+                                          date=it["date"][:10], snippet=text[:500])
+            prompt += PROMPT.format(recent=recent, title=it["title"], source=it["source"],
+                                    text="(see the facts you found via search)")
+        else:
+            prompt = PROMPT.format(recent=recent, title=it["title"], source=it["source"], text=text[:12000])
+        calls += 1
+        try:
+            res = ask_gemini(prompt, search=search)
+        except QuotaExceeded:
+            print("Лимит Gemini на сегодня исчерпан — продолжу в следующий запуск")
+            break
+        if not res:
             fails = state["fails"].get(it["id"], 0) + 1
             state["fails"][it["id"]] = fails
             if fails >= 3:
                 seen[it["id"]] = NOW.isoformat()
                 state["fails"].pop(it["id"], None)
-            continue
-
-        recent = "\n".join(f"- {t}" for t in state["recent_titles"][-25:]) or "- (none)"
-        prompt = PROMPT.format(recent=recent, title=it["title"], source=it["source"], text=text[:12000])
-        calls += 1
-        try:
-            res = ask_gemini(prompt)
-        except QuotaExceeded:
-            print("Лимит Gemini на сегодня исчерпан — продолжу в следующий запуск")
-            break
-        if not res:
             continue
 
         seen[it["id"]] = NOW.isoformat()

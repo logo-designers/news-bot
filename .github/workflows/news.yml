@@ -28,7 +28,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
-          CHANNEL: "@Ukraine_Jewish_Kosher_Guide"
+          CHANNEL: "@UJ_KG"
       - name: Save state
         if: always()
         run: |

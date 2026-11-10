@@ -32,8 +32,8 @@ import trafilatura
 
 # ============================ НАСТРОЙКИ ============================
 
-CHANNEL = os.environ.get("CHANNEL", "@Ukraine_Jewish_Kosher_Guide")
-SIGNATURE = "@Ukraine_Jewish_Kosher_Guide"  # подпись внизу поста ("" — без подписи)
+CHANNEL = os.environ.get("CHANNEL", "@UJ_KG")
+SIGNATURE = CHANNEL  # подпись внизу поста ("" — без подписи)
 SHOW_SOURCE = True       # писать в конце "מקור: <название СМИ>" (без ссылки)
 USE_PHOTOS = False       # True — прикладывать фото из статьи (фото принадлежат СМИ)
 MAX_POSTS_PER_RUN = 3    # не больше N постов за запуск (запуск раз в час)
@@ -85,6 +85,11 @@ FEEDS = [
     wp_tag("https://www.jdn.co.il", "אומן"),
     wp_tag("https://www.jdn.co.il", "קייב"),
     "https://vaadua.org/rss.xml",
+    "https://jewishnews.com.ua/feed",
+    # --- Bing News: отдельные еврейские сайты Украины ---
+    bing("site:jewishnews.com.ua", "uk-UA"),
+    bing("site:fjc.org.ua", "ru-RU"),
+    bing("site:vaadua.org", "uk-UA"),
     # --- Bing News ---
     bing("יהודי אוקראינה", "he-IL"),
     bing("הקהילה היהודית באוקראינה", "he-IL"),
@@ -535,6 +540,12 @@ def run(state):
             state["recent_titles"].append(title)
             posted += 1
             time.sleep(5)
+        else:
+            seen.pop(it["id"], None)  # не потеряем новость — опубликуем в следующий раз
+            alert_admin(state, "tg_publish",
+                        f"не могу опубликовать в {CHANNEL}. Проверьте, что бот — администратор канала "
+                        f"с правом публикации, и что юзернейм канала указан верно в news.yml.")
+            break
 
     print(f"\nОпубликовано: {posted}")
 

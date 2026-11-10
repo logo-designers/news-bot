@@ -50,6 +50,16 @@ JEWISH_WORDS = [
     "jew", "rabbi", "chabad", "synagog", "uman", "holocaust",
 ]
 
+# Для новостей из поисковиков (Bing / Google) — ещё и упоминание Украины
+UKRAINE_WORDS = [
+    "אוקראינ", "קייב", "קיוב", "אודסה", "חרקוב", "דנייפר", "דניפרו", "לבוב", "לביב", "אומן", "ז'יטומיר",
+    "זפוריז", "צ'רניגוב", "ברדיצ'ב", "מז'יבוז'", "באבי יאר", "בבי יאר",
+    "украин", "україн", "киев", "київ", "одес", "харьк", "харків", "днепр", "дніпр", "львов", "львів",
+    "умань", "уман", "житомир", "запорож", "запоріж", "чернигов", "чернігів", "бердичев", "бердичів",
+    "винниц", "вінниц", "бабий яр", "бабин яр", "меджибож",
+    "ukrain", "kyiv", "kiev", "odesa", "odessa", "kharkiv", "dnipro", "lviv", "uman", "babyn yar",
+]
+
 
 def gnews(query, lang):
     """RSS поиска Google News за 2 дня."""
@@ -207,9 +217,14 @@ def bing_real_url(link):
     return q["url"][0] if q.get("url") else link
 
 
-def looks_relevant(text):
-    t = text.lower()
-    return any(w in t for w in JEWISH_WORDS)
+def looks_relevant(it):
+    t = (it["title"] + " " + it["rss_text"]).lower()
+    if not any(w in t for w in JEWISH_WORDS):
+        return False
+    # ленты JDN по тегам Украины и сайт Ваада и так про Украину; поисковикам — проверяем
+    if it["kind"] != "direct" and not any(w in t for w in UKRAINE_WORDS):
+        return False
+    return True
 
 
 def collect():
@@ -365,7 +380,9 @@ def gemini_models():
         print("Не удалось получить список моделей:", e)
     # стабильные новые flash -> flash-lite -> preview
     found.sort(key=lambda n: ("preview" in n, "lite" in n, -version_key(n), len(n)))
-    models = ["gemini-flash-latest"] + found + ["gemini-flash-lite-latest"]
+    # lite отвечает быстрее и имеет больший бесплатный лимит — для этой задачи её достаточно
+    models = ["gemini-flash-lite-latest", "gemini-flash-latest"] + \
+             [m for m in found if "lite" in m] + [m for m in found if "lite" not in m]
     _models_cache = list(dict.fromkeys(models))
     print("Модели Gemini:", ", ".join(_models_cache[:8]))
     return _models_cache
@@ -393,41 +410,46 @@ def ask_gemini(prompt, search=False):
 
     limited = 0
     models = gemini_models()
-    for model in models:
-        for attempt in range(2):
+    # два круга по моделям: если все "заняты" — пауза и ещё раз
+    for round_ in range(2):
+        busy = False
+        for model in models:
             try:
                 r = requests.post(f"{API}/models/{model}:generateContent",
-                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=180)
+                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=120)
             except requests.RequestException as e:
-                print(f"  Gemini {model}: сеть", e)
-                time.sleep(5)
+                print(f"  Gemini {model}: сеть", str(e)[:100])
+                busy = True
                 continue
             if r.status_code == 429:
                 limited += 1
                 print(f"  Gemini {model}: лимит")
-                break
+                if limited >= 4:
+                    break
+                continue
             if r.status_code in (401, 403) or "API_KEY_INVALID" in r.text:
                 raise RuntimeError("Ключ Gemini не работает: " + r.text[:300])
             if r.status_code in (400, 404):
                 print(f"  Gemini {model}: {r.status_code} недоступна")
-                break
+                continue
             if r.status_code >= 500:
-                print(f"  Gemini {model}: сервер занят ({r.status_code}), повтор")
-                time.sleep(8)
+                print(f"  Gemini {model}: сервер занят ({r.status_code})")
+                busy = True
                 continue
             try:
                 parts = r.json()["candidates"][0]["content"]["parts"]
                 raw = "".join(p.get("text", "") for p in parts if not p.get("thought"))
                 res = parse_json(raw)
                 if res is not None:
+                    print(f"  ответила модель {model}")
                     return res
                 print(f"  Gemini {model}: ответ без JSON")
             except Exception as e:
                 print(f"  Gemini {model}: непонятный ответ", e, r.text[:200])
+        if not busy or limited >= 4:
             break
-        if limited >= 3:
-            break
-    if limited:
+        time.sleep(20)
+    if limited >= 4 or (limited and not busy):
         raise SearchUnavailable() if search else QuotaExceeded()
     return None
 
@@ -446,7 +468,7 @@ def run(state):
     for it in items:
         if it["id"] in seen:
             continue
-        if not looks_relevant(it["title"] + " " + it["rss_text"]):
+        if not looks_relevant(it):
             seen[it["id"]] = NOW.isoformat()  # явно не по теме — не тратим ИИ
             continue
         new.append(it)
